@@ -1,6 +1,8 @@
 import sys
 import pytz
+import time
 import uuid
+import json
 import logging
 import configargparse
 from configargparse import RawTextHelpFormatter
@@ -22,6 +24,7 @@ logger.addHandler(handler)
 
 class TodoistAPI():
 
+
     def __init__(self, api_token, do_commit):
         self.api_token = api_token
         self.api = todoist.TodoistAPI(self.api_token)
@@ -29,15 +32,19 @@ class TodoistAPI():
         self._command_count = 0
         self._do_commit = do_commit
 
+
     def _chunk_api(func):
         def wrapper(self, *args, **kwargs):
             self._command_count += 1
-            if self._command_count > 20:
+
+            # The Todoist API has a command limit of 100 per commit. Leaving some wiggle room.
+            if self._command_count > 90:
                 logger.debug("API call chunk size reached. Committing chunk.")
                 self.commit()
                 self._command_count = 0
             return func(self, *args, **kwargs)
         return wrapper
+
 
     def get_project(self, project_name):
         for project in self.api.projects.all():
@@ -45,17 +52,18 @@ class TodoistAPI():
                 return project
         return self._create_project(project_name)
 
+
     @_chunk_api
     def _create_project(self, project_name):
         temp_id = str(uuid.uuid4())
         project = self.api.projects.add(temp_id=temp_id, name=project_name)
         return project
 
+
     @_chunk_api
     def add_item(self, project, ical_item):
-        temp_id = str(uuid.uuid4())
         td_item_info = {}
-        td_item_info['content'] = str(ical_item['SUMMARY'])
+        td_item_info['content'] = ical_item['SUMMARY'].encode('utf-8')
         try:
             td_item_info['due_date_utc'] = ical_item['DUE'].dt.astimezone(pytz.timezone('UTC')).strftime('%Y-%m-%dT%H:%M')
             td_item_info['date_string'] = td_item_info['due_date_utc']
@@ -81,18 +89,26 @@ class TodoistAPI():
             logger.debug("Item is not recurring: '%s'. " % ical_item['SUMMARY'])
 
         logger.debug("iCal task info to be added: %s" % td_item_info)
-        item = self.api.items.add(project_id=project['id'], temp_id=temp_id, **td_item_info)
+        item = self.api.items.add(project_id=project['id'], **td_item_info)
         logger.debug("Added item %s" % item.data)
 
-        # Mark as completed as necessary
-        try:
-            if ical_item['STATUS'] == 'COMPLETED':
-                item.close()
-                logger.info("Marked item %s as completed" % item['id'])
-        except KeyError:
-            logger.debug("Item %s is not completed" % item['id'])
+        # Mark the item as completed if necessary
+        self.close_item(ical_item, item)
 
         return item
+
+
+    @_chunk_api
+    def close_item(self, ical_item, td_item):
+        try:
+            if ical_item['STATUS'] == 'COMPLETED':
+                td_item.close()
+                logger.info("Marked item %s as completed" % td_item['id'])
+        except KeyError:
+            logger.debug("Item %s is not completed" % td_item['id'])
+
+        return td_item
+
 
     @_chunk_api
     def add_reminder(self, item):
@@ -104,10 +120,39 @@ class TodoistAPI():
 
         return reminder
 
+
     def commit(self):
         if self._do_commit == True:
-            response = self.api.commit()
-            logger.info("Commit response: %s" % response)
+            MAX_TRIES = 3
+            tries = 0
+            while True:
+                response = self.api.commit()
+                logger.info("Commit response: %s" % response)
+                if isinstance(response, dict):
+                    if response.has_key('error_code') and tries < MAX_TRIES:
+                        # Todoist has an API rate limit of 50 requests/min. error_code 35 means we hit the limit.
+                        if response['error_code'] == 35:
+                            logger.info("API rate limit reached. Waiting 65 seconds before trying again.")
+                            time.sleep(65)
+                            tries += 1
+                            continue
+                        # Error code 40 means the API is unavailable. There should be a retry_after we can check
+                        if response['error_code'] == 40:
+                            retry_after = 30 # retry after 30s by default
+                            try:
+                                error_extra = response['error_extra']
+                                retry_after = error_extra['retry_after']
+                            except:
+                                pass
+                            logger.info("API unavailable. Retry after %d seconds." % retry_after)
+                            continue
+
+                break
+            if tries < MAX_TRIES:
+                logger.info("Commit succeeded")
+            else:
+                logger.exception("Commit failed - too many retries. Aborting.")
+                sys.exit("Too many retries")
         else:
             logger.info("No-op is set. Not committing.")
 
